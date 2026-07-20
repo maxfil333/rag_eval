@@ -1,0 +1,11 @@
+[project]
+name = "rag-eval"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "langchain-community<0.4",
+    "openai>=2.46.0",
+    "ragas>=0.4.3",
+]
