@@ -9,6 +9,11 @@ from src.models.model_ai_tunnel import create_model
 from src.models.config import cfg
 
 
+########################################################
+# Не работает на новой версии Ragas
+########################################################
+
+
 model = create_model(model_name='gpt-5-mini')
 
 embeddings = LangchainEmbeddingsWrapper(
