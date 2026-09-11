@@ -4,16 +4,12 @@ from time import perf_counter
 from ragas.embeddings import OpenAIEmbeddings
 from ragas.llms import llm_factory
 from ragas.testset import TestsetGenerator
-from ragas.testset.graph import KnowledgeGraph, Node, NodeType
 from ragas.testset.persona import Persona
 from ragas.testset.synthesizers.single_hop.specific import SingleHopSpecificQuerySynthesizer
-from ragas.testset.transforms import KeyphrasesExtractor, apply_transforms
 
 from src.models.config import cfg
 from src.ragas.dataset import docs
 
-
-# init parameters
 
 start_time = perf_counter()
 
@@ -29,70 +25,43 @@ if cfg.TEMPERATURE is not None:
     llm_kwargs["temperature"] = cfg.TEMPERATURE
 
 generator_llm = llm_factory("gpt-5-mini", client=openai_client, **llm_kwargs)
-generator_embeddings = OpenAIEmbeddings(client=openai_client, model="text-embedding-3-small")
-
-
-# KnowledgeGraph
-
-kg = KnowledgeGraph()
-for doc in docs:
-    kg.nodes.append(
-        Node(
-            type=NodeType.DOCUMENT,
-            properties={"page_content": doc},
-        )
-    )
-print(kg)
-
-
-# transforms
-
-apply_transforms(
-    kg,
-    transforms=[KeyphrasesExtractor(llm=generator_llm)],
+generator_embeddings = OpenAIEmbeddings(
+    client=openai_client,
+    model="text-embedding-3-small",
 )
-
-
-# personas
 
 personas = [
     Persona(name="boy", role_description="6 years old boy"),
     Persona(name="professor", role_description="university professor"),
 ]
 
-
-# synthesizers
-
 query_distribution = [
     (
         SingleHopSpecificQuerySynthesizer(
             llm=generator_llm,
-            property_name="keyphrases",
+            property_name="entities",  # или "themes"
         ),
         1.0,
     ),
 ]
 
-
-# generator
-
 generator = TestsetGenerator(
     llm=generator_llm,
     embedding_model=generator_embeddings,
-    knowledge_graph=kg,
     persona_list=personas,
 )
 
 
 def create_testset():
-    testset = generator.generate(
+    # docs уже нарезаны → NodeType.CHUNK + default_transforms_for_prechunked
+    return generator.generate_with_chunks(
+        chunks=docs,
         testset_size=4,
         query_distribution=query_distribution,
     )
-    return testset
 
 
 if __name__ == "__main__":
     testset = create_testset()
-    testset.to_pandas().to_csv("testset.csv", index=False)
+    testset.to_pandas().to_csv("testset_chunks.csv", index=False)
     print(f"End time: {perf_counter() - start_time}")
