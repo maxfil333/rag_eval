@@ -125,7 +125,7 @@ def query_distribution(llm):
         (
             SingleHopSpecificQuerySynthesizer(
                 llm=llm,
-                property_name="keyphrases"
+                property_name="keyphrases"  # Term / keyword / NER entity for which the question will be generated
             ),
             0.5,
         ),
@@ -133,7 +133,7 @@ def query_distribution(llm):
             MultiHopSpecificQuerySynthesizer(
                 llm=llm,
                 property_name="keyphrases",
-                relation_type="keyphrases_overlap",
+                relation_type="keyphrases_overlap",  # (from OverlapScoreBuilder) relation.type = property_name + "_overlap" → "keyphrases" + "_overlap" = keyphrases_overlap
             ),
             0.5,
         ),
