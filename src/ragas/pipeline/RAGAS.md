@@ -13,6 +13,8 @@ Ragas в данном случает фундаментально выполня
 
 Генерация датасета и оценка пайплайна — два полностью независимых процесса. Каждый из них выполняет свою роль в решении исходной задачи по выбору лучшей конфигурации.
 
+> Версия, на которой всё написано и проверено: ==`ragas 0.4.3`==. API генерации датасета в ragas меняется довольно активно, поэтому все имена классов ниже — про эту версию.
+
 # Evaluation dataset
 
 ## Описание проблемы
@@ -37,15 +39,83 @@ LLM для каждого документа или чанка генериру�
 
 Для решения описанных выше проблем и генерация более реалистичного датасета можно применить ragas.
 
-## Как ragas генерирует датасет
+## Как ragas генерирует датасет: схема целиком
 
-### KnowledgeGraph
+Прежде чем разбирать детали, важно увидеть весь маршрут. Он линейный:
+
+```
+docs: list[str]
+   │
+   ▼
+[1] KnowledgeGraph — пустая заготовка
+    узлы типа DOCUMENT со свойством page_content
+   │
+   │  apply_transforms(kg, transforms)
+   ▼
+[2] transforms — конвейер обогащения графа, 4 типа шагов:
+    Splitters   →  режут DOCUMENT на CHUNK
+    Extractors  →  добавляют свойства узлам (headlines, keyphrases, embedding)
+    Relations   →  строят ребра между чанками
+    Filters     →  удаляют бесполезные чанки
+    (порядок шагов задаёте вы, и он важен: см. ниже)
+   │
+   │  на выходе: чанки + свойства + ребра
+   ▼
+[3] Сценарии (scenarios) — «условия задачи», ещё не вопросы
+    (узел | пара узлов) × persona × style × length
+   │
+   │  generator.generate(testset_size, query_distribution)
+   ▼
+[4] Сэмплы — LLM по сценарию пишет вопрос и эталонный ответ
+   │
+   ▼
+eval_dataset.csv:  user_input | reference_contexts | reference | ...
+```
+
+В коде это ровно четыре смысловых строки:
+
+```python
+kg = build_knowledge_graph(docs)                    # [1]
+apply_transforms(kg, transforms=build_transforms(llm, embeddings))   # [2]
+generator = TestsetGenerator(llm, embeddings, kg, persona_list=personas)
+testset = generator.generate(testset_size=6, query_distribution=...)  # [3] + [4]
+```
+
+Зачем вообще граф, а не просто список чанков? Список чанков даёт только вопросы «по одному фрагменту». Ребра позволяют взять **пару связанных чанков** и попросить вопрос, ответ на который лежит сразу в двух местах — это и есть multi-hop.
+
+Дальше — по одному разделу на каждый блок схемы:
+
+- **[1] и [2]** — `KnowledgeGraph`, `transforms` (Splitters / Extractors / Relations / Filters);
+- **[3]** — персонажи, стили и длина, single-hop vs multi-hop, генерация сценариев;
+- **[4]** — уже сам прогон и результат в разделе «Собираем пайплайн».
+
+> Ниже в блоках кода с комментарием-путём (например `# ragas/testset/graph.py`) показаны ==внутренности библиотеки==. Их не нужно писать у себя — они приведены только чтобы было видно, откуда берутся имена свойств и типов, на которые мы опираемся в конфигурации.
+
+### [1] KnowledgeGraph
 
 KnowledgeGraph - базовая структура данных, хранящая корпус документов в виде графа. Узлами (nodes) являются фрагменты текста (чанки), обогащенные выделенными сущностями, ключевыми словами, заголовками и прочей вспомогательной информацией. 
 Ребрами (edges) — семантические или логические связи между ними (например, «относится к», «использует», «следствие из»).
-### transforms
+
+Структура — это два списка:
+
+```python
+# ragas/testset/graph.py — внутренности библиотеки, реализовывать не нужно
+class KnowledgeGraph:
+    nodes: list[Node]                    # Node(type: NodeType, properties: dict)
+    relationships: list[Relationship]    # Relationship(type: str, source, target, properties)
+```
+
+Что из этого важно на практике:
+
+- `NodeType` — это `DOCUMENT`, `CHUNK` или `UNKNOWN`. Вся «начинка» узла живёт в свободном словаре `properties`: `page_content`, `headlines`, `keyphrases`, `embedding` и т.д.
+- Тип ребра — ==обычная строка==. Синтезаторы вопросов ищут ребра именно по строковому имени типа (см. ниже про `relation_type`) — отсюда растёт главная ловушка ragas.
+- Граф можно сохранить и переиспользовать: `kg.save("kg.json")` / `KnowledgeGraph.load("kg.json")`. Построение графа — самая дорогая часть (много вызовов LLM), поэтому при экспериментах граф строят один раз, а потом гоняют по нему разные `query_distribution`.
+
+### [2] transforms
 
 Конвейер (пайплайн) обработки данных, который превращает сырые документы в заполненный `KnowledgeGraph`. Трансформации прогоняют тексты через LLM и эмбеддинги.
+
+`transforms` — это просто список, и порядок в нём и есть логика построения графа. Типов трансформаций четыре (Splitters, Extractors, Relationship builders, Filters), и у всех есть общий параметр `filter_nodes: Callable[[Node], bool]` — на каких узлах работать (по умолчанию на всех).
 
 #### Splitters
 
@@ -54,29 +124,39 @@ KnowledgeGraph - базовая структура данных, храняща�
 - Разбивают исходный массивный текст на базовые узлы (`Node` / чанки).
 - **Пример:** ==`HeadlinesSplitter`== нарезает документ не по фиксированному количеству символов, а по логическим заголовкам (H1, H2, H3), сохраняя контекстную целостность разделов (у Nodes уже должны быть свойства `headlines` и `page_content`)
 
+Что делает `HeadlineSplitter(min_tokens=300, max_tokens=1000)`:
+
+- режет текст по позициям заголовков из `headlines`; слишком длинные секции дорезает по словам, слишком короткие ==склеивает с соседними==, чтобы не появлялись чанки-огрызки;
+- если документ целиком короче `min_tokens` или заголовки не нашлись — возвращает исходный узел без изменений;
+- кроме узлов создаёт ребра `child` (document → chunk) и `next` (chunk → chunk).
+
 #### Extractors
 
 > *добавляют свойства Node*
 
-- KeyphrasesExtractor (property_name: str = "keyphrases")
-- HeadlinesExtractor (property_name: str = "headlines")
-- EmbeddingExtractor
-- ThemesExtractor (property_name: str = "themes")
-- TitleExtractor (property_name: str = "title")
-- NERExtractor (property_name: str = "entities")
-- SummaryExtractor (property_name: str = "summary")
+| Extractor                  | property_name       | что кладёт                                | лимит по умолчанию      |
+| -------------------------- | ------------------- | ----------------------------------------- | ----------------------- |
+| `HeadlinesExtractor`       | `headlines`         | список заголовков                          | `max_num=5`             |
+| `KeyphrasesExtractor`      | `keyphrases`        | ключевые фразы                             | `max_num=5`             |
+| `NERExtractor`             | `entities`          | именованные сущности                       | `max_num_entities=10`   |
+| `ThemesExtractor`          | `themes`            | темы и концепции                           | `max_num_themes=10`     |
+| `SummaryExtractor`         | `summary`           | краткое содержание (до 10 предложений)     | —                       |
+| `TitleExtractor`           | `title`             | заголовок документа                        | —                       |
+| `TopicDescriptionExtractor`| `topic_description` | описание основной темы                     | —                       |
+| `EmbeddingExtractor`       | `embedding`         | вектор текста из `embed_property_name`     | —                       |
+
+Все, кроме `EmbeddingExtractor`, — это LLM-вызовы со строгим structured output (Pydantic-модель + instructor), поэтому результат всегда типизирован. Проверить экстрактор в отрыве от пайплайна можно так (это иллюстрация для консоли, в пайплайне вызывать вручную не нужно):
 
 ```python
-from ragas.testset.transforms.extractors import NERExtractor
-
 extractor = NERExtractor()
-output = [await extractor.extract(node) for node in sample_nodes]
-output[0]
+await extractor.extract(node)
 
 > ('entities', ['Einstein', 'theory of relativity', 'space', 'time' ...])
 ```
 
-#### Relactions
+У `EmbeddingExtractor` два параметра, которые легко перепутать: `embed_property_name` — **что** векторизуем (`page_content`, `summary`), а `property_name` — **куда** кладём результат (`embedding`, `summary_embedding`). Отсюда стандартная связка «эмбеддинг саммари документа»: `EmbeddingExtractor(embed_property_name="summary", property_name="summary_embedding")`.
+
+#### Relationship builders
 
 > *создают ребра между Nodes*
 
@@ -84,45 +164,366 @@ output[0]
 
 Каждый `RelationshipBuilder` настраивается на работу с **конкретным свойством** узла (которое до этого положил туда экстрактор).
 
-- CosineSimilarityBuilder - использует embeddings
-- JaccardSimilarityBuilder 
-- OverlapScoreBuilder - использует множества
+| Builder                    | читает property        | тип создаваемого ребра               | смысл                                     |
+| -------------------------- | ---------------------- | ------------------------------------ | ----------------------------------------- |
+| `CosineSimilarityBuilder`  | `embedding`            | `new_property_name`                  | косинусная близость векторов               |
+| `SummaryCosineSimilarityBuilder` | `summary_embedding` | `summary_cosine_similarity`        | близость документов по саммари             |
+| `JaccardSimilarityBuilder` | `entities`             | `new_property_name`                  | Жаккар по множествам                       |
+| `OverlapScoreBuilder`      | `entities`             | ==`{property_name}_overlap`==        | доля «пересекающихся» строк (fuzzy match)  |
+
+Здесь спрятана ==первая серьёзная ловушка== ragas: **имя типа ребра формируется по-разному** у разных builder-ов. `CosineSimilarityBuilder` берёт его из `new_property_name`, а `OverlapScoreBuilder` игнорирует `new_property_name` в типе и склеивает тип из `property_name`:
+
+```python
+# ragas/testset/transforms/relationship_builders/traditional.py, OverlapScoreBuilder.transform
+# внутренности библиотеки, реализовывать не нужно
+Relationship(
+    type=f"{self.property_name}_overlap",                                  # keyphrases_overlap
+    properties={f"{self.property_name}_{self.new_property_name}": score,   # keyphrases_overlap_score
+                "overlapped_items": overlapped_items},                     # совпавшие пары фраз
+)
+```
+
+То есть если мы построили ребра `OverlapScoreBuilder(property_name="keyphrases")`, то тип ребра будет `keyphrases_overlap`, и ровно эту строку потом надо передать синтезатору в `relation_type`. Иначе синтезатор не найдёт ни одного кластера и упадёт с `No clusters found in the knowledge graph`.
+
+**Про два порога в `OverlapScoreBuilder`** — они про разные вещи:
+
+- `distance_threshold=0.9` — порог похожести ==двух отдельных строк== (Jaro-Winkler). Он позволяет считать `"atomic clock"` и `"atomic clocks"` одной ключевой фразой. Ниже — агрессивнее и больше ложных совпадений, выше — только почти дословные.
+- `threshold=0.01` — порог итогового score ==пары узлов==, где score = `совпавшие пары / все проверенные пары`. Знаменатель — декартово произведение ключевых фраз двух чанков, то есть при `max_num=5` до 25 пар. Поэтому одно совпадение даёт score ≈ 0.04, а `0.01` фактически означает «создай ребро, если есть хотя бы одно совпадение». Такое же значение стоит и в дефолтных трансформациях ragas.
+- Бонусом builder игнорирует топ-5% самых частотных фраз по корпусу, чтобы граф не превратился в клику из-за слова, которое есть в каждом чанке.
+
+**Про `threshold` в `CosineSimilarityBuilder`** — это обычный порог косинуса, и он чувствительнее, чем кажется: у современных эмбеддингов случайные пары текстов из одного домена спокойно дают 0.7–0.8. Поэтому `0.75` — это «много ребер», а `0.9` (дефолт библиотеки) — «мало и по делу».
 
 #### Filters
 
-- CustomNodeFilter (Удаляет чанки, не связанные с родительским document)
+> *удаляют Nodes*
 
-### Моделирование персонажей
+- `CustomNodeFilter` — LLM-фильтр «пригодности чанка для вопроса». Для каждого чанка он берёт `summary` **родительского** документа (через ребро `child`), просит LLM оценить чанк по рубрике 1–5 («насколько содержимое соответствует теме документа и есть ли о чём спрашивать») и удаляет узел при score ≤ `min_score=2`.
+- Отсюда важное следствие: фильтр ==работает только если у документа есть `summary`==. Если `SummaryExtractor` в пайплайне нет, фильтр просто напишет warning и ничего не отфильтрует.
 
+#### filter_nodes и порядок трансформаций
 
-### Стили и длина вопросов
+`filter_nodes` — не косметика, а способ не сжигать деньги и не ломать граф. Два типичных мотива:
 
+1. **Экономия.** После сплиттера в графе лежат и документы, и чанки. Если у `KeyphrasesExtractor` не указать `filter_nodes=is_chunk`, он честно вызовет LLM ещё и на каждом полном документе — то есть на тексте, который уже покрыт чанками.
+2. **Корректность.** `CosineSimilarityBuilder` бросает `ValueError`, если у **любого** узла в графе нет свойства `embedding`. Документы эмбеддинги не получали → без `filter_nodes=is_chunk` билдер упадёт.
 
+Про порядок: `HeadlinesExtractor` обязан идти **до** `HeadlineSplitter`, потому что сплиттер читает `headlines` у узла и без них бросает `'headlines' property not found in this node`. Дальше — экстракторы по чанкам, и только потом builder-ы, которые эти свойства читают. Общий инвариант: ==трансформация читает только то, что положила предыдущая==.
 
-### Single-hop и Milti-hop queries
+#### Parallel
 
-- specific query
-- abstract query
+`Parallel(KeyphrasesExtractor(...), EmbeddingExtractor(...))` — обёртка, которая группирует трансформации, не зависящие друг от друга. Внутри одной трансформации корутины по узлам и так выполняются конкурентно, так что основной выигрыш по времени вы получаете и без `Parallel` — но группировка делает список `transforms` читаемым и сразу показывает, между какими шагами зависимости нет.
 
+### [3] Моделирование персонажей
 
-### Генерация сценариев
+Персонаж (`Persona`) — это структура из двух полей, которую мы задаём сами: `Persona(name="student", role_description="curious university student")`.
 
+Работает это так: перед генерацией вопроса ragas берёт темы узла (ключевые фразы / сущности) и через промпт `ThemesPersonasMatchingPrompt` просит LLM ==сопоставить персонажей с темами==. Получается словарь вида `{"student": ["arithmetic mean", "median"], "professor": [...]}`. Вопрос генерируется только для тех пар (персонаж, тема), которые LLM признала осмысленными, а сам персонаж попадает в промпт — поэтому студент и профессор про один и тот же чанк спросят по-разному.
 
+Два практических момента:
 
+- Если `persona_list` не передать в `TestsetGenerator`, ragas ==сгенерирует персонажей сам== (`generate_personas_from_kg`). Но эта функция требует у узлов `summary` и `summary_embedding`, то есть без `SummaryExtractor` + `EmbeddingExtractor(embed_property_name="summary")` она упадёт. В нашем пайплайне персонажи заданы руками именно поэтому.
+- Параметр `num_personas: int = 3` в `generate()` ==режет список==. Если вы передали 5 персонажей, по умолчанию будут использованы только 3 (список предварительно перемешивается).
 
+### [3] Стили и длина вопросов
 
+Стиль и длина — два enum-а библиотеки; выбирать их вручную не нужно, ragas сам перебирает все 4 × 3 = 12 комбинаций и семплирует их так, чтобы датасет был разнообразным. Знать их значения полезно, потому что они попадают в колонки итогового CSV:
 
+```python
+# ragas/testset/synthesizers/base.py — внутренности библиотеки, реализовывать не нужно
+QueryStyle:  MISSPELLED | PERFECT_GRAMMAR | POOR_GRAMMAR | WEB_SEARCH_LIKE
+QueryLength: SHORT | MEDIUM | LONG
+```
 
+Главное: стиль и длина не «постобрабатывают» готовый вопрос — они ==передаются в промпт как условия генерации== вместе с персонажем, темой и контекстом. Именно так в датасете появляются строки вроде `Wht is TAI?` — это не баг, а `MISSPELLED` + `SHORT`, то есть ровно тот тип запроса, на котором реальный retrieval и ломается.
+
+### [3] Single-hop и Multi-hop queries
+
+Терминология:
+
+- **single-hop** — для ответа достаточно одного чанка;
+- **multi-hop** — нужно склеить информацию из ≥ 2 чанков;
+- **specific** — вопрос про конкретный термин / сущность («что такое TAI?»);
+- **abstract** — вопрос про идею или связь между темами («как X влияет на Y?»).
+
+В ragas 0.4.3 доступны три синтезатора:
+
+| Синтезатор                          | как выбирает узлы                                    | что требует в графе                              |
+| ----------------------------------- | ---------------------------------------------------- | ------------------------------------------------ |
+| `SingleHopSpecificQuerySynthesizer`  | все узлы, у которых есть `property_name`             | свойство узла (`entities` / `keyphrases`)         |
+| `MultiHopSpecificQuerySynthesizer`   | пары узлов, соединённые ребром типа `relation_type`  | ребра `*_overlap` + `overlapped_items` в ребре    |
+| `MultiHopAbstractQuerySynthesizer`   | кластеры узлов по ребрам со свойством `summary_similarity` (глубина до 3) | `summary_similarity` на ребрах + `themes` у узлов |
+
+Обратите внимание на дефолты: у обоих `Specific`-синтезаторов `property_name = "entities"`, а у multi-hop ещё и `relation_type = "entities_overlap"`. Это дефолты «под `NERExtractor`». Если вы, как в нашем пайплайне, строите граф на `keyphrases`, ==оба параметра нужно переопределить==.
+
+Multi-hop склеивает контексты с маркерами `<1-hop>`, `<2-hop>` — по ним потом удобно отличать multi-hop-строки в датасете.
+
+### [3] и [4] Генерация сценариев и сэмплов
+
+Ключевая идея, которая делает датасет разнообразным: генерация ==разделена на две фазы==.
+
+**Фаза 1 — сценарии.** Сценарий — это ещё не вопрос, а «условия задачи»: набор узлов (один для single-hop, пара для multi-hop) плюс тема, персонаж, стиль и длина. Строится он так: отобрать подходящие узлы → посчитать, сколько вопросов нужно с одного узла (`ceil(n / len(nodes))`) → сопоставить темы с персонажами через LLM → построить ==все== комбинации `(узел, тема, персонаж, стиль, длина)` → перемешать и отобрать нужное количество, стараясь не повторять пару «узел + тема».
+
+Multi-hop делает то же самое, но стартует от пар узлов, соединённых ребром, а темами берёт `overlapped_items` из ребра — ровно те ключевые фразы, которые есть в обоих чанках. Это гарантирует, что вопрос действительно «про пересечение», а не про два случайных текста.
+
+**Фаза 2 — сэмплы.** Каждый сценарий уходит в промпт `QueryAnswerGenerationPrompt`, который возвращает structured output `{query, answer}`. В промпте жёстко зашито требование ==faithfulness к контексту==: «Do not add any information not included in or inferable from the context». Именно поэтому сгенерированный `reference` годится как эталон — он по построению не выходит за пределы `reference_contexts`.
+
+Зачем такое разделение? Оно превращает «сгенерируй 100 вопросов» в контролируемую задачу семплирования: разнообразие по чанкам, персонажам и стилям обеспечивается ==до== обращения к LLM, а не надеждой на то, что модель сама не выдаст 100 однотипных «What is X?».
+
+**Про `testset_size`.** Он делится по `query_distribution` через `math.ceil`, а внутри синтезаторов округляется вверх ещё раз. Итоговое количество строк — ==примерно== `testset_size`, обычно чуть больше.
+
+---
+
+## Собираем пайплайн
+
+Теперь тот же маршрут со схемы, но кодом. Всё ниже — уже наш код, его нужно писать; полный файл: `full_pipeline.py`.
+
+Соответствие со схемой: шаги 0–2 — это блок **[1]**, шаг 3 — блок **[2]**, шаги 4–5 — настройка блоков **[3]/[4]**, шаг 6 — сам прогон.
+
+### 0. Документы
+
+На вход ragas нужен просто `list[str]`. Берём три статьи из английской Википедии через HuggingFace-датасет в streaming-режиме (чтобы не качать десятки гигабайт):
+
+```python
+HF_DATASET = "wikimedia/wikipedia"
+HF_CONFIG = "20231101.en"
+
+def load_hf_documents() -> list[str]:
+    doc_titles = ["International Atomic Time", "Agricultural science", "Arithmetic mean"]
+    found: dict[str, str] = {}
+
+    stream = load_dataset(HF_DATASET, HF_CONFIG, split="train", streaming=True)
+    for row in stream:
+        if row["title"] in doc_titles:
+            found[row["title"]] = row["text"]
+            if len(found) == len(doc_titles):
+                break
+
+    missing = set(doc_titles) - found.keys()
+    if missing:
+        raise RuntimeError(f"Titles not found: {sorted(missing)}")
+
+    return [found[title] for title in doc_titles]
+```
+
+Статьи выбраны неполитические и достаточно длинные — важно, чтобы документ был заметно больше `min_tokens`, иначе сплиттер вернёт его одним куском.
+
+### 1. LLM и эмбеддинги
+
+```python
+openai_client = AsyncOpenAI(
+    api_key=os.getenv("AI_TUNNEL_API_KEY"),
+    base_url="https://api.aitunnel.ru/v1/",
+)
+llm = llm_factory("gpt-5-mini", client=openai_client, max_tokens=8192)
+embeddings = OpenAIEmbeddings(client=openai_client, model="text-embedding-3-small")
+```
+
+`llm_factory` возвращает обёртку с structured output (через instructor), поэтому все промпты ragas отдают готовые Pydantic-объекты, а не текст, который надо парсить. Клиент передаётся снаружи — значит подойдёт любой OpenAI-совместимый провайдер, достаточно поменять `base_url`. `max_tokens=8192` здесь не роскошь: `reference` для multi-hop получается длинным, и при маленьком лимите ответ обрежется и structured output развалится.
+
+### 2. Затравка графа
+
+```python
+def build_knowledge_graph(documents: list[str]) -> KnowledgeGraph:
+    kg = KnowledgeGraph()
+    for doc in documents:
+        kg.nodes.append(Node(type=NodeType.DOCUMENT, properties={"page_content": doc}))
+    return kg
+```
+
+Никакой магии: граф стартует как список узлов-документов с единственным свойством `page_content`. Всё остальное появится в результате трансформаций.
+
+### 3. Трансформации
+
+```python
+def build_transforms(llm, embedding_model):
+    def _is_document(node: Node) -> bool:
+        return node.type == NodeType.DOCUMENT
+
+    def _is_chunk(node: Node) -> bool:
+        return node.type == NodeType.CHUNK
+
+    return [
+        # 1. Заголовки — только у документов
+        HeadlinesExtractor(llm=llm, filter_nodes=_is_document),
+
+        # 2. Резка по заголовкам: DOCUMENT -> CHUNK + ребра child/next
+        HeadlineSplitter(min_tokens=300, max_tokens=1000),
+
+        # 3. Обогащение чанков
+        Parallel(
+            KeyphrasesExtractor(llm=llm, property_name="keyphrases", filter_nodes=_is_chunk),
+            EmbeddingExtractor(
+                embedding_model=embedding_model,
+                property_name="embedding",
+                embed_property_name="page_content",
+                filter_nodes=_is_chunk,
+            ),
+        ),
+
+        # 4. Ребра
+        Parallel(
+            CosineSimilarityBuilder(
+                property_name="embedding",
+                new_property_name="cosine_similarity",
+                threshold=0.75,
+                filter_nodes=_is_chunk,
+            ),
+            OverlapScoreBuilder(
+                property_name="keyphrases",
+                new_property_name="overlap_score",
+                threshold=0.01,
+                distance_threshold=0.9,
+                filter_nodes=_is_chunk,
+            ),
+        ),
+    ]
+```
+
+Читается как цепочка зависимостей: `headlines` → чанки → (`keyphrases`, `embedding`) → ребра поверх этих свойств. Каждый `filter_nodes` здесь либо экономит LLM-вызовы, либо спасает от `ValueError` у builder-а.
+
+> **Честная ремарка про `CosineSimilarityBuilder` в этом пайплайне.** Он создаёт ребра типа `cosine_similarity`, но ==ни один из выбранных ниже синтезаторов их не читает==: multi-hop specific ходит по `keyphrases_overlap`, а multi-hop abstract — по `summary_similarity`. Сейчас эти ребра (и нужный для них `EmbeddingExtractor`) работают как диагностика связности корпуса. Чтобы эмбеддинги реально участвовали в генерации, нужен другой набор — `SummaryExtractor` + `EmbeddingExtractor(embed_property_name="summary", property_name="summary_embedding")` + `CosineSimilarityBuilder(property_name="summary_embedding", new_property_name="summary_similarity")` + `ThemesExtractor` — и тогда в распределение можно добавить `MultiHopAbstractQuerySynthesizer`. Либо эти два шага просто убрать.
+
+### 4. Генератор и персонажи
+
+```python
+def build_generator(llm, embedding_model, kg: KnowledgeGraph) -> TestsetGenerator:
+    personas = [
+        Persona(name="student", role_description="curious university student"),
+        Persona(name="professor", role_description="university professor"),
+    ]
+    return TestsetGenerator(
+        llm=llm,
+        embedding_model=embedding_model,
+        knowledge_graph=kg,
+        persona_list=personas,
+    )
+```
+
+Персонажи заданы вручную — так мы не платим за их автогенерацию и не зависим от наличия `summary`/`summary_embedding` в графе.
+
+### 5. Распределение типов вопросов
+
+```python
+def build_query_distribution(llm):
+    return [
+        (
+            SingleHopSpecificQuerySynthesizer(
+                llm=llm,
+                property_name="keyphrases",   # тема, вокруг которой строится вопрос
+            ),
+            0.5,
+        ),
+        (
+            MultiHopSpecificQuerySynthesizer(
+                llm=llm,
+                property_name="keyphrases",
+                relation_type="keyphrases_overlap",
+                # OverlapScoreBuilder: relation.type = f"{property_name}_overlap"
+                # "keyphrases" + "_overlap" = "keyphrases_overlap"
+            ),
+            0.5,
+        ),
+    ]
+```
+
+Это то место, где сходится вся конфигурация графа. Цепочка, которую стоит держать в голове:
+
+```
+KeyphrasesExtractor(property_name="keyphrases")
+        ↓  кладёт node.properties["keyphrases"]
+OverlapScoreBuilder(property_name="keyphrases")
+        ↓  создаёт Relationship(type="keyphrases_overlap", properties={... "overlapped_items": [...]})
+MultiHopSpecificQuerySynthesizer(property_name="keyphrases", relation_type="keyphrases_overlap")
+```
+
+Если хоть одно звено рассинхронизировано — вы получите либо `No nodes found with the 'entities' property`, либо `No clusters found in the knowledge graph`. Оба сообщения означают одно и то же: ==синтезатор ищет в графе то, чего вы туда не положили==.
+
+Веса `0.5 / 0.5` — это доли от `testset_size`, а не вероятности при семплировании: ragas просто делит размер датасета между синтезаторами.
+
+### 6. Запуск
+
+```python
+kg = build_knowledge_graph(docs)
+transforms = build_transforms(llm, embeddings)
+generator = build_generator(llm, embeddings, kg)
+
+with asyncio.Runner() as runner:
+    _share_event_loop_across_ragas_runs(runner)
+
+    apply_transforms(kg, transforms=transforms)
+    print(f"KG after transforms: nodes={len(kg.nodes)} relationships={len(kg.relationships)}")
+
+    testset = generator.generate(
+        testset_size=6,
+        query_distribution=build_query_distribution(llm),
+    )
+
+testset.to_pandas().to_csv("eval_dataset.csv", index=False)
+```
+
+Два шага — `apply_transforms` (построить граф) и `generator.generate` (сгенерировать вопросы) — специально разделены. Между ними полезно вставить `kg.save("kg.json")`: граф строится дорого, а генерировать по нему можно сколько угодно раз с разными распределениями.
+
+<small>Техническая деталь: `_share_event_loop_across_ragas_runs` подменяет `ragas.async_utils.run` и `ragas.executor.run` так, чтобы обе фазы работали в одном event loop. Без этого `AsyncOpenAI`-клиент, созданный вне цикла ragas, на Windows натыкается на закрытый loop. К логике генерации это отношения не имеет, но без такого шима код падает.</small>
+
+### 7. Результат
+
+`testset.to_pandas()` даёт таблицу со следующими колонками:
+
+| колонка              | что внутри                                                            |
+| -------------------- | --------------------------------------------------------------------- |
+| `user_input`         | сгенерированный вопрос                                                 |
+| `reference_contexts` | список чанков, из которых он сгенерирован (для multi-hop с `<N-hop>`)  |
+| `reference`          | эталонный ответ, построенный **только** по этим контекстам              |
+| `persona_name`       | имя персонажа                                                          |
+| `query_style`        | `MISSPELLED` / `PERFECT_GRAMMAR` / `POOR_GRAMMAR` / `WEB_SEARCH_LIKE`   |
+| `query_length`       | `SHORT` / `MEDIUM` / `LONG`                                            |
+| `synthesizer_name`   | какой синтезатор породил строку                                        |
+
+Примеры вопросов из реального прогона (3 статьи, `testset_size=6` → 3 single-hop + 3 multi-hop):
+
+```
+Wht is TAI?
+  → student / MISSPELLED / SHORT / single_hop_specific_query_synthesizer
+
+how atomic clocks used for TAI?
+  → professor / POOR_GRAMMAR / SHORT / single_hop_specific_query_synthesizer
+
+As a curious university student, how did gravitational time dilation influence
+the formation and realization of International Atomic Time (TAI), and what
+specific corrections were implemented to account for differing clock rates
+due to altitude?
+  → student / PERFECT_GRAMMAR / LONG / single_hop_specific_query_synthesizer
+
+What Agricultural science mean and how it different from agronomy, and who did
+early experiments like at Rothamsted and what the Hatch Act did for
+agricultural science?
+  → multi_hop_specific_query_synthesizer  (reference_contexts: <1-hop> + <2-hop>)
+```
+
+Ровно то, что мы хотели получить вместо «идеальных» LLM-вопросов: опечатки, сломанная грамматика, короткие запросы и вопросы, которые физически нельзя закрыть одним чанком.
+
+Две вещи, которые бросаются в глаза в CSV и обе являются ==особенностями ragas 0.4.3==, а не ошибками пайплайна:
+
+1. У multi-hop строк ==пустые `persona_name`, `query_style`, `query_length`==. Персонаж, стиль и длина в сценарии есть и в промпт передаются — но `MultiHopQuerySynthesizer._generate_sample` возвращает `SingleTurnSample` только с `user_input` / `reference` / `reference_contexts` и не прокидывает эти поля дальше. У single-hop они прокидываются.
+2. Просьба про «как бы от лица персонажа» иногда ==протекает в текст вопроса==: `"As a curious university student, how did..."`. Это следствие того, что `role_description` подаётся в промпт как часть условий. Лечится более нейтральными описаниями персонажей или кастомизацией промпта через `PromptMixin`.
+
+### Чек-лист перед запуском на своих данных
+
+- Документы длиннее `min_tokens`, иначе чанков не будет.
+- `HeadlinesExtractor` до `HeadlineSplitter`.
+- У всех экстракторов и builder-ов выставлен `filter_nodes` (`_is_chunk` / `_is_document`).
+- `property_name` синтезатора совпадает с тем, что положил экстрактор (`entities` — дефолт!).
+- `relation_type` совпадает с типом ребра, который реально создал builder (`{property_name}_overlap`).
+- `kg.save(...)` после `apply_transforms` — чтобы не платить за граф повторно.
+- Итоговый датасет ==просмотрен глазами==. Синтетика — это черновик разметки, а не готовый эталон: строки с «протёкшим» персонажем или слишком общим вопросом лучше выкинуть до того, как по ним начнут сравниваться конфигурации RAG.
+
+На этом первая часть заканчивается: у нас есть `eval_dataset.csv` с колонками `user_input`, `reference_contexts`, `reference`. Во второй части подключим к нему собственно метрики — и посмотрим, как по этому датасету сравнивать конфигурации RAG.
 
 ___
 
 # Evaluation metrics
 
 
-
 ## Context precision
-
-
-
 
 
