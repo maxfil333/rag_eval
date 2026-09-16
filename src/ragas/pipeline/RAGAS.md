@@ -67,8 +67,8 @@ docs
 [2] apply_transforms(kg, transforms)
        прогоняем конвейер трансформаций графа из 4 типов шагов (порядок задаём мы):
          Splitters   →  режут DOCUMENT на CHUNK
-         Extractors  →  добавляют свойства узлам (headlines, keyphrases, embedding)
-         Relations   →  строят ребра между чанками
+         Extractors  →  добавляют свойства узлам (headlines, keyphrases, summary, ...)
+         Relations   →  строят ребра между узлами
          Filters     →  удаляют бесполезные чанки
        граф меняется in place: это всё тот же объект kg
    │
@@ -275,7 +275,17 @@ Relationship(
 
 - перед перебором builder выбрасывает топ-5% самых частотных фраз по всему корпусу — иначе граф превратился бы в клику из-за слова, которое есть в каждом чанке.
 
-**Про `threshold` в `CosineSimilarityBuilder`** — это обычный порог косинуса, и он чувствительнее, чем кажется: у современных эмбеддингов случайные пары текстов из одного домена спокойно дают 0.7–0.8. Поэтому `0.75` — это «много ребер», а `0.9` (дефолт библиотеки) — «мало и по делу».
+**Про `threshold` в `CosineSimilarityBuilder`** — это обычный порог косинуса, но подобрать его «по интуиции» не получается: абсолютные значения зависят и от модели эмбеддингов, и от того, насколько однороден корпус. Дефолт самого класса — `0.9`, в `default_transforms` библиотеки для длинных документов стоит `0.7`.
+
+На наших трёх статьях косинусы между эмбеддингами их саммари оказались такими:
+
+```
+International Atomic Time  <->  Agricultural science : 0.132
+International Atomic Time  <->  Arithmetic mean      : 0.257
+Agricultural science       <->  Arithmetic mean      : 0.202
+```
+
+То есть с библиотечным порогом `0.7` не возникло бы ни одного ребра, и синтезатор, который по ним ходит, упал бы с `No relationships match the provided condition`. Практический вывод простой: пороги нужно мерить на своём корпусе, а не переносить из примеров. Мы поставили `0.25` — так остаётся единственное самое осмысленное ребро (среднее арифметическое ↔ атомное время, которое буквально считается как взвешенное среднее по часам), а случайные пары вроде «сельское хозяйство ↔ атомное время» не связываются.
 
 #### Filters
 
@@ -289,9 +299,9 @@ Relationship(
 `filter_nodes` — способ не сжигать деньги и не ломать граф. Два типичных мотива:
 
 1. **Экономия.** После сплиттера в графе лежат и документы, и чанки. Если у `KeyphrasesExtractor` не указать `filter_nodes=is_chunk`, он честно вызовет LLM ещё и на каждом полном документе — то есть на тексте, который уже покрыт чанками.
-2. **Корректность.** `CosineSimilarityBuilder` бросает `ValueError`, если у **любого** узла в графе нет свойства `embedding`. Документы эмбеддинги не получали → без `filter_nodes=is_chunk` билдер упадёт.
+2. **Корректность.** `CosineSimilarityBuilder` бросает `ValueError`, если у **любого** узла в графе нет свойства, по которому он считает косинус. Мы считаем эмбеддинги только для документов, поэтому без `filter_nodes=_is_document` билдер упадёт на первом же чанке.
 
-Про порядок: `HeadlinesExtractor` обязан идти **до** `HeadlineSplitter`. Дальше — экстракторы по чанкам, и только потом builder-ы, которые эти свойства читают. Общий инвариант: **трансформация читает только то, что положила предыдущая**.
+Про порядок: `HeadlinesExtractor` обязан идти **до** `HeadlineSplitter`, а `SummaryExtractor` — до `EmbeddingExtractor`, который эти саммари векторизует. Builder-ы идут последними, потому что читают свойства, положенные экстракторами. Общий инвариант: **трансформация читает только то, что положила предыдущая**.
 
 #### Parallel
 
@@ -360,6 +370,15 @@ QueryLength: SHORT | MEDIUM | LONG
 
 Коротко: `relation_type` выбирает **пары чанков**, `property_name` — **темы внутри этих чанков**.
 
+`MultiHopAbstractQuerySynthesizer(relation_property="summary_similarity", abstract_property_name="themes")` устроен иначе, и в двух местах не так, как можно ожидать:
+
+1. **`relation_property`** — ребра он ищет **не по `type`, а по наличию свойства** с таким именем в `properties` ребра (`rel.get_property("summary_similarity")`). Это единственный синтезатор, который смотрит в `properties`, а не в `type`;
+2. кластеры он собирает не из пар, а из **путей длиной до 3 узлов**. У нас эти рёбра соединяют документы, поэтому кластер — это группа тематически близких документов;
+3. дальше он спускается от документов к их чанкам по рёбрам `child` (их создаёт сплиттер) — именно текст чанков попадёт в `reference_contexts`;
+4. **`abstract_property_name`** — у этих чанков он берёт свойство `themes` и через промпт `ConceptCombinationPrompt` просит LLM собрать из тем разных документов **комбинацию концепций**, по которой имеет смысл задать один общий вопрос.
+
+Отсюда требования к графу: `themes` у чанков (то есть `ThemesExtractor`) и рёбра со свойством `summary_similarity` между документами. И здесь есть отдельная ловушка: в библиотеке существует готовый `SummaryCosineSimilarityBuilder`, но он кладёт свойство с именем `summary_cosine_similarity` — на одно слово длиннее, чем ищет синтезатор. Поэтому имя приходится задавать руками через `new_property_name="summary_similarity"` у обычного `CosineSimilarityBuilder`.
+
 ### [3] и [4] Сценарии и генерация вопросов
 
 Ключевая идея, которая делает датасет разнообразным: генерация **разделена на две фазы**.
@@ -400,6 +419,7 @@ from ragas.llms import llm_factory
 from ragas.testset import TestsetGenerator
 from ragas.testset.graph import KnowledgeGraph, Node, NodeType
 from ragas.testset.persona import Persona
+from ragas.testset.synthesizers.multi_hop.abstract import MultiHopAbstractQuerySynthesizer
 from ragas.testset.synthesizers.multi_hop.specific import MultiHopSpecificQuerySynthesizer
 from ragas.testset.synthesizers.single_hop.specific import SingleHopSpecificQuerySynthesizer
 from ragas.testset.transforms import (
@@ -410,11 +430,15 @@ from ragas.testset.transforms import (
     KeyphrasesExtractor,
     OverlapScoreBuilder,
     Parallel,
+    SummaryExtractor,
     apply_transforms,
 )
+from ragas.testset.transforms.extractors.llm_based import ThemesExtractor
 
 load_dotenv()
 ```
+
+Обратите внимание на последнюю строку: `ThemesExtractor` (как и `NERExtractor`) в `ragas.testset.transforms` не реэкспортируется, его нужно импортировать из `extractors.llm_based` напрямую.
 
 ### 0. Документы
 
@@ -486,24 +510,32 @@ def build_transforms(llm, embedding_model):
         # Based on the `headlines` feature, we split the original documents into chunks.
         HeadlineSplitter(min_tokens=300, max_tokens=1000),
 
+        # `summary` must exist before we can embed it in the next step.
+        SummaryExtractor(llm=llm, filter_nodes=_is_document),
+
         # Extractors
         Parallel(
             KeyphrasesExtractor(llm=llm, property_name="keyphrases", filter_nodes=_is_chunk),
+            ThemesExtractor(llm=llm, property_name="themes", filter_nodes=_is_chunk),
             EmbeddingExtractor(
                 embedding_model=embedding_model,
-                property_name="embedding",
-                embed_property_name="page_content",
-                filter_nodes=_is_chunk,
+                property_name="summary_embedding",
+                embed_property_name="summary",
+                filter_nodes=_is_document,
             ),
         ),
 
         # Relations
         Parallel(
+            # MultiHopAbstractQuerySynthesizer looks up relations by the property name
+            # "summary_similarity", so `new_property_name` has to match it exactly.
+            # Our three articles are topically unrelated: measured summary similarities
+            # are 0.13-0.26, so the ragas default of 0.7 would yield zero relations.
             CosineSimilarityBuilder(
-                property_name="embedding",
-                new_property_name="cosine_similarity",
-                threshold=0.75,
-                filter_nodes=_is_chunk,
+                property_name="summary_embedding",
+                new_property_name="summary_similarity",
+                threshold=0.25,
+                filter_nodes=_is_document,
             ),
             OverlapScoreBuilder(
                 property_name="keyphrases",
@@ -516,9 +548,14 @@ def build_transforms(llm, embedding_model):
     ]
 ```
 
-Читается как цепочка зависимостей: `headlines` → чанки → (`keyphrases`, `embedding`) → ребра поверх этих свойств. Каждый `filter_nodes` здесь либо экономит LLM-вызовы, либо спасает от `ValueError` у builder-а.
+Здесь важно видеть, что пайплайн работает **на двух уровнях сразу**, и путать их нельзя:
 
-> **Честная ремарка про `CosineSimilarityBuilder` в этом пайплайне.** Он создаёт ребра типа `cosine_similarity`, но **ни один из выбранных ниже синтезаторов их не читает**: multi-hop specific ходит по `keyphrases_overlap`, а multi-hop abstract — по `summary_similarity`. Сейчас эти ребра (и нужный для них `EmbeddingExtractor`) работают как диагностика связности корпуса. Чтобы эмбеддинги реально участвовали в генерации, нужен другой набор — `SummaryExtractor` + `EmbeddingExtractor(embed_property_name="summary", property_name="summary_embedding")` + `CosineSimilarityBuilder(property_name="summary_embedding", new_property_name="summary_similarity")` + `ThemesExtractor` — и тогда в распределение можно добавить `MultiHopAbstractQuerySynthesizer`. Либо эти два шага просто убрать.
+- **уровень чанков** — `keyphrases` и `themes`, поверх `keyphrases` строятся ребра `keyphrases_overlap`. Это питает single-hop и multi-hop specific;
+- **уровень документов** — `summary`, его эмбеддинг `summary_embedding` и косинусные ребра `summary_similarity` между документами. Это питает multi-hop abstract, который потом сам спустится от документов к их чанкам.
+
+Отсюда и `filter_nodes` в каждом шаге: он не только экономит LLM-вызовы, но и удерживает каждое свойство на своём уровне графа. Цепочка зависимостей читается сверху вниз: `headlines` → чанки → (`keyphrases`, `themes` у чанков; `summary` → `summary_embedding` у документов) → ребра поверх этих свойств.
+
+> **Почему эмбеддинги считаются по саммари документа, а не по тексту чанка.** Соблазнительно написать `EmbeddingExtractor(embed_property_name="page_content", filter_nodes=_is_chunk)` и строить косинусные ребра между чанками — но такие ребра **никто не прочитает**. Единственный синтезатор, который вообще смотрит на косинусную близость, — `MultiHopAbstractQuerySynthesizer`, и он ищет ребра со свойством `summary_similarity`. Если имя свойства или уровень узлов не совпали, вы просто платите за эмбеддинги и получаете ребра, которые ни на что не влияют.
 
 ### 4. Генератор и персонажи
 
@@ -548,7 +585,7 @@ def build_query_distribution(llm):
                 llm=llm,
                 property_name="keyphrases",   # тема, вокруг которой строится вопрос
             ),
-            0.5,
+            0.4,
         ),
         (
             MultiHopSpecificQuerySynthesizer(
@@ -558,24 +595,42 @@ def build_query_distribution(llm):
                 # OverlapScoreBuilder: relation.type = f"{property_name}_overlap"
                 # "keyphrases" + "_overlap" = "keyphrases_overlap"
             ),
-            0.5,
+            0.4,
+        ),
+        (
+            MultiHopAbstractQuerySynthesizer(
+                llm=llm,
+                relation_property="summary_similarity",  # ребра от CosineSimilarityBuilder
+                abstract_property_name="themes",         # свойство от ThemesExtractor
+            ),
+            0.2,
         ),
     ]
 ```
 
-Это то место, где сходится вся конфигурация графа. Цепочка, которую стоит держать в голове:
+Это то место, где сходится вся конфигурация графа. Две цепочки, которые стоит держать в голове, — по одной на каждый уровень:
 
 ```
 KeyphrasesExtractor(property_name="keyphrases")
-        ↓  кладёт node.properties["keyphrases"]
+        ↓  кладёт node.properties["keyphrases"] чанкам
 OverlapScoreBuilder(property_name="keyphrases")
         ↓  создаёт Relationship(type="keyphrases_overlap", properties={... "overlapped_items": [...]})
 MultiHopSpecificQuerySynthesizer(property_name="keyphrases", relation_type="keyphrases_overlap")
 ```
 
-Если хоть одно звено рассинхронизировано — вы получите либо `No nodes found with the 'entities' property`, либо `No clusters found in the knowledge graph`. Оба сообщения означают одно и то же: **синтезатор ищет в графе то, чего вы туда не положили**.
+```
+SummaryExtractor  →  ThemesExtractor(property_name="themes")
+        ↓  кладёт summary документам, themes чанкам
+EmbeddingExtractor(embed_property_name="summary", property_name="summary_embedding")
+        ↓  кладёт вектор саммари документам
+CosineSimilarityBuilder(property_name="summary_embedding", new_property_name="summary_similarity")
+        ↓  создаёт Relationship(properties={"summary_similarity": 0.257})
+MultiHopAbstractQuerySynthesizer(relation_property="summary_similarity", abstract_property_name="themes")
+```
 
-Веса `0.5 / 0.5` — это доли от `testset_size`, а не вероятности при семплировании: ragas просто делит размер датасета между синтезаторами.
+Если хоть одно звено рассинхронизировано — вы получите либо `No nodes found with the 'entities' property`, либо `No clusters found in the knowledge graph`, либо `No relationships match the provided condition`. Все три сообщения означают одно и то же: **синтезатор ищет в графе то, чего вы туда не положили**.
+
+Веса `0.4 / 0.4 / 0.2` — это доли от `testset_size`, а не вероятности при семплировании: ragas просто делит размер датасета между синтезаторами.
 
 ### 6. Запуск
 
@@ -600,6 +655,19 @@ testset.to_pandas().to_csv("eval_dataset.csv", index=False)
 
 Два шага — `apply_transforms` (построить граф) и `generator.generate` (сгенерировать вопросы) — специально разделены. Между ними полезно вставить `kg.save("kg.json")`: граф строится дорого, а генерировать по нему можно сколько угодно раз с разными распределениями.
 
+Самая полезная диагностика — распечатать, сколько и каких ребер получилось, **до** генерации. Для трёх статей вывод выглядит так:
+
+```
+KG before transforms: KnowledgeGraph(nodes: 3, relationships: 0)
+KG after transforms: nodes=15 relationships=29
+  rel child: 12                # документ → его чанки (создаёт сплиттер)
+  rel next: 9                  # соседние чанки внутри документа (создаёт сплиттер)
+  rel summary_similarity: 1    # документ ↔ документ (CosineSimilarityBuilder)
+  rel keyphrases_overlap: 7    # чанк ↔ чанк (OverlapScoreBuilder)
+```
+
+Если напротив `summary_similarity` или `keyphrases_overlap` стоит `0` — соответствующий синтезатор упадёт, и порог (`threshold`) надо снижать. Проверить это за секунды дешевле, чем поймать исключение через три минуты прогона.
+
 <small>Техническая деталь: `_share_event_loop_across_ragas_runs` подменяет `ragas.async_utils.run` и `ragas.executor.run` так, чтобы обе фазы работали в одном event loop. Без этого `AsyncOpenAI`-клиент, созданный вне цикла ragas, на Windows натыкается на закрытый loop. К логике генерации это отношения не имеет, но без такого шима код падает.</small>
 
 ### 7. Результат
@@ -616,41 +684,44 @@ testset.to_pandas().to_csv("eval_dataset.csv", index=False)
 | `query_length`       | `SHORT` / `MEDIUM` / `LONG`                                           |
 | `synthesizer_name`   | какой синтезатор породил строку                                       |
 
-Примеры вопросов из реального прогона (3 статьи, `testset_size=6` → 3 single-hop + 3 multi-hop):
+Примеры вопросов из реального прогона (3 статьи, `testset_size=6` → 8 строк: 3 + 3 + 2):
 
 ```
-Wht is TAI?
-  → student / MISSPELLED / SHORT / single_hop_specific_query_synthesizer
+why there is leap seconds?
+  → student / POOR_GRAMMAR / SHORT / single_hop_specific_query_synthesizer
 
-how atomic clocks used for TAI?
-  → professor / POOR_GRAMMAR / SHORT / single_hop_specific_query_synthesizer
+How did gravitational time dilation affect the International Atomic Time (TAI)?
+  → professor / PERFECT_GRAMMAR / SHORT / single_hop_specific_query_synthesizer
 
-As a curious university student, how did gravitational time dilation influence
-the formation and realization of International Atomic Time (TAI), and what
-specific corrections were implemented to account for differing clock rates
-due to altitude?
-  → student / PERFECT_GRAMMAR / LONG / single_hop_specific_query_synthesizer
+How did early experiments by Johann Friedrich Mayer and the long-term Rothamsted
+trials, together with US policies such as the Hatch Act, contribute to the
+develpment of Agricultural science, and how does Agricultural science diffr
+from agronomy and agriculture?
+  → multi_hop_specific_query_synthesizer   (reference_contexts: <1-hop> + <2-hop>)
 
-What Agricultural science mean and how it different from agronomy, and who did
-early experiments like at Rothamsted and what the Hatch Act did for
-agricultural science?
-  → multi_hop_specific_query_synthesizer  (reference_contexts: <1-hop> + <2-hop>)
+What is a weighted average and how is the weighted average of atomic clocks used
+in International Atomic Time (over 450 clocks in 80+ national laboratories)?
+  → multi_hop_abstract_query_synthesizer   (reference_contexts: <1-hop> + <2-hop>)
 ```
 
-Ровно то, что мы хотели получить вместо «идеальных» LLM-вопросов: опечатки, сломанная грамматика, короткие запросы и вопросы, которые физически нельзя закрыть одним чанком.
+Ровно то, что мы хотели получить вместо «идеальных» LLM-вопросов: опечатки (`develpment`, `diffr`), сломанная грамматика, короткие запросы и вопросы, которые физически нельзя закрыть одним чанком.
+
+Отдельно стоит посмотреть на последний пример — он показывает, **зачем вообще нужен был косинус по саммари**. Ребро `summary_similarity` связало статьи *Arithmetic mean* и *International Atomic Time*, синтезатор спустился к их чанкам, нашёл в темах общее понятие «weighted average» и построил вопрос, который склеивает определение из статистики с его применением в метрологии. Ни один из чанков по отдельности на такой вопрос не отвечает, и `keyphrases_overlap` эту пару не нашёл бы — статьи написаны разным словарём, буквальных пересечений фраз между ними почти нет. Это и есть разница между *specific* (общий термин) и *abstract* (общая идея).
 
 Две вещи, которые бросаются в глаза в CSV и обе являются **особенностями ragas 0.4.3**, а не ошибками пайплайна:
 
 1. У multi-hop строк **пустые `persona_name`, `query_style`, `query_length`**. Персонаж, стиль и длина в сценарии есть и в промпт передаются — но `MultiHopQuerySynthesizer._generate_sample` возвращает `SingleTurnSample` только с `user_input` / `reference` / `reference_contexts` и не прокидывает эти поля дальше. У single-hop они прокидываются.
-2. Просьба про «как бы от лица персонажа» иногда **протекает в текст вопроса**: `"As a curious university student, how did..."`. Это следствие того, что `role_description` подаётся в промпт как часть условий. Лечится более нейтральными описаниями персонажей или кастомизацией промпта через `PromptMixin`.
+2. Просьба про «как бы от лица персонажа» иногда **протекает в текст вопроса**: `"ok so as a student i wanna know in detail why the arithmetic mean is..."`. Это следствие того, что `role_description` подаётся в промпт как часть условий. Лечится более нейтральными описаниями персонажей или кастомизацией промпта через `PromptMixin`.
 
 ### Чек-лист перед запуском на своих данных
 
 - Документы длиннее `min_tokens`, иначе чанков не будет.
-- `HeadlinesExtractor` до `HeadlineSplitter`.
+- `HeadlinesExtractor` до `HeadlineSplitter`, `SummaryExtractor` до `EmbeddingExtractor`.
 - У всех экстракторов и builder-ов выставлен `filter_nodes` (`_is_chunk` / `_is_document`).
 - `property_name` синтезатора совпадает с тем, что положил экстрактор (`entities` — дефолт!).
 - `relation_type` совпадает с типом ребра, который реально создал builder (`{property_name}_overlap`).
+- Для abstract-синтезатора: ребра несут свойство именно `summary_similarity`, а `threshold` подобран по замеренным на своём корпусе значениям косинуса.
+- Счётчик ребер по типам распечатан после `apply_transforms` — нулей быть не должно.
 - `kg.save(...)` после `apply_transforms` — чтобы не платить за граф повторно.
 - Итоговый датасет **просмотрен глазами**. Синтетика — это черновик разметки, а не готовый эталон: строки с «протёкшим» персонажем или слишком общим вопросом лучше выкинуть до того, как по ним начнут сравниваться конфигурации RAG.
 

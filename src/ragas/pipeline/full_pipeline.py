@@ -1,6 +1,5 @@
 import os
 import asyncio
-from pathlib import Path
 from time import perf_counter
 from dotenv import load_dotenv
 
@@ -14,6 +13,7 @@ from ragas.llms import llm_factory
 from ragas.testset import TestsetGenerator
 from ragas.testset.graph import KnowledgeGraph, Node, NodeType
 from ragas.testset.persona import Persona
+from ragas.testset.synthesizers.multi_hop.abstract import MultiHopAbstractQuerySynthesizer
 from ragas.testset.synthesizers.multi_hop.specific import MultiHopSpecificQuerySynthesizer
 from ragas.testset.synthesizers.single_hop.specific import SingleHopSpecificQuerySynthesizer
 from ragas.testset.transforms import (
@@ -24,8 +24,10 @@ from ragas.testset.transforms import (
     KeyphrasesExtractor,
     OverlapScoreBuilder,
     Parallel,
+    SummaryExtractor,
     apply_transforms,
 )
+from ragas.testset.transforms.extractors.llm_based import ThemesExtractor
 
 
 load_dotenv()
@@ -107,24 +109,32 @@ def build_transforms(llm, embedding_model):
         # Based on the `headlines` feature, we split the original documents into chunks.
         HeadlineSplitter(min_tokens=300, max_tokens=1000),
 
+        # `summary` must exist before we can embed it in the next step.
+        SummaryExtractor(llm=llm, filter_nodes=_is_document),
+
         # Extractors
         Parallel(
             KeyphrasesExtractor(llm=llm, property_name="keyphrases", filter_nodes=_is_chunk),
+            ThemesExtractor(llm=llm, property_name="themes", filter_nodes=_is_chunk),
             EmbeddingExtractor(
                 embedding_model=embedding_model,
-                property_name="embedding",
-                embed_property_name="page_content",
-                filter_nodes=_is_chunk,
+                property_name="summary_embedding",
+                embed_property_name="summary",
+                filter_nodes=_is_document,
             ),
         ),
 
         # Relations
         Parallel(
+            # MultiHopAbstractQuerySynthesizer looks up relations by the property name
+            # "summary_similarity", so `new_property_name` has to match it exactly.
+            # Our three articles are topically unrelated: measured summary similarities
+            # are 0.13-0.26, so the ragas default of 0.7 would yield zero relations.
             CosineSimilarityBuilder(
-                property_name="embedding",
-                new_property_name="cosine_similarity",
-                threshold=0.75,
-                filter_nodes=_is_chunk,
+                property_name="summary_embedding",
+                new_property_name="summary_similarity",
+                threshold=0.25,
+                filter_nodes=_is_document,
             ),
             OverlapScoreBuilder(
                 property_name="keyphrases",
@@ -157,7 +167,7 @@ def build_query_distribution(llm):
                 llm=llm,
                 property_name="keyphrases"  # Term / keyword / NER entity for which the question will be generated
             ),
-            0.5,
+            0.4,
         ),
         (
             MultiHopSpecificQuerySynthesizer(
@@ -168,7 +178,15 @@ def build_query_distribution(llm):
                 # relation.type = property_name + "_overlap"
                 # "keyphrases" + "_overlap" = keyphrases_overlap
             ),
-            0.5,
+            0.4,
+        ),
+        (
+            MultiHopAbstractQuerySynthesizer(
+                llm=llm,
+                relation_property="summary_similarity",  # relations built by CosineSimilarityBuilder
+                abstract_property_name="themes",  # node property filled by ThemesExtractor
+            ),
+            0.2,
         ),
     ]
 
