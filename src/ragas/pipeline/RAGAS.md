@@ -213,28 +213,37 @@ await extractor.extract(node)
 
 Важная часть в построении графа знаний, обеспечивающая **связи между узлами**. Без Relations ноды графа будут обогащены после трансформаций (иметь entities, title и т.д.), но ноды не будут связаны друг с другом, т.е. получится граф без ребер.
 
-Каждый `RelationshipBuilder` настраивается на работу с **конкретным свойством** узла (которое до этого положил туда экстрактор).
-
-| Builder                          | читает property     | тип создаваемого ребра        | смысл                                     |
-|----------------------------------|---------------------|-------------------------------|-------------------------------------------|
-| `CosineSimilarityBuilder`        | `embedding`         | `new_property_name`           | косинусная близость векторов              |
-| `SummaryCosineSimilarityBuilder` | `summary_embedding` | `summary_cosine_similarity`   | близость документов по саммари            |
-| `JaccardSimilarityBuilder`       | `entities`          | `new_property_name`           | Жаккар по множествам                      |
-| `OverlapScoreBuilder`            | `entities`          | **`{property_name}_overlap`** | доля «пересекающихся» строк (fuzzy match) |
-
-Здесь спрятана **первая серьёзная ловушка** ragas: **имя типа ребра формируется по-разному** у разных builder-ов. `CosineSimilarityBuilder` берёт его из `new_property_name`, а `OverlapScoreBuilder` игнорирует `new_property_name` в типе и склеивает тип из `property_name`:
+Каждый `RelationshipBuilder` смотрит на **одно свойство** узла (которое до этого положил экстрактор) и решает, соединять ли два чанка. Проще всего понять по результату — вот ребро, которое создаёт наш `OverlapScoreBuilder(property_name="keyphrases", new_property_name="overlap_score")`:
 
 ```python
-# ragas/testset/transforms/relationship_builders/traditional.py, OverlapScoreBuilder.transform
-# внутренности библиотеки, реализовывать не нужно
 Relationship(
-    type=f"{self.property_name}_overlap",                                  # keyphrases_overlap
-    properties={f"{self.property_name}_{self.new_property_name}": score,   # keyphrases_overlap_score
-                "overlapped_items": overlapped_items},                     # совпавшие пары фраз
+    source=<чанк A>,
+    target=<чанк B>,
+    type="keyphrases_overlap",                   # имя связи
+    properties={
+        "keyphrases_overlap_score": 0.08,        # насколько связаны
+        "overlapped_items": [                    # чем именно связаны
+            ("atomic clock", "atomic clocks"),
+            ("caesium", "caesium"),
+        ],
+    },
 )
 ```
 
-То есть если мы построили ребра `OverlapScoreBuilder(property_name="keyphrases")`, то тип ребра будет `keyphrases_overlap`, и ровно эту строку потом надо передать синтезатору в `relation_type`. Иначе синтезатор не найдёт ни одного кластера и упадёт с `No clusters found in the knowledge graph`.
+Оба поля потом читает синтезатор multi-hop вопросов, но для разного:
+
+- **`type`** — чтобы **найти** нужные рёбра: синтезатор берёт только те, у которых `type` совпал с его параметром `relation_type`. Не совпало — рёбер для него нет, и генерация падает с `No clusters found in the knowledge graph`.
+- **`properties["overlapped_items"]`** — чтобы понять, **о чём спрашивать**: совпавшие фразы становятся темой вопроса. Поэтому multi-hop вопрос получается осмысленным, а не «расскажи про два случайных текста».
+
+Отсюда два требования к ребру: его `type` должен совпадать с `relation_type` синтезатора, и оно обязано нести `overlapped_items`. Косинусные рёбра второму требованию не удовлетворяют, так что multi-hop specific по ним не работает.
+
+| Builder                    | читает у узла | что считает                  | `type` ребра                  |
+|----------------------------|---------------|------------------------------|-------------------------------|
+| `CosineSimilarityBuilder`  | `embedding`   | косинусную близость векторов | `new_property_name`           |
+| `JaccardSimilarityBuilder` | `entities`    | Жаккар по множествам         | `new_property_name`           |
+| `OverlapScoreBuilder`      | `entities`    | долю совпавших строк (fuzzy) | **`{property_name}_overlap`** |
+
+Последняя строка — **главная ловушка** ragas: имя типа формируется не так, как у остальных. Косинусный builder берёт его прямо из `new_property_name`, а `OverlapScoreBuilder` `new_property_name` в типе игнорирует и склеивает имя из `property_name`. Поэтому при `property_name="keyphrases"` тип ребра — `keyphrases_overlap`, и ровно эту строку надо передать синтезатору.
 
 **Про два порога в `OverlapScoreBuilder`** — они про разные вещи:
 
