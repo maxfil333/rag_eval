@@ -100,7 +100,7 @@ testset.to_pandas().to_csv("eval_dataset.csv")
 eval_dataset.csv:  user_input | reference_contexts | reference | ...
 ```
 
-Тот же маршрут кодом — сначала готовим все шесть входов, потом пять строк самого пайплайна:
+Тот же маршрут кодом (схематично) — сначала готовим все шесть входов, потом пять строк самого пайплайна:
 
 ```python
 # готовим входы
@@ -185,16 +185,16 @@ _и выдает ошибку `ValueError: 'headlines' property not found in thi
 
 > *добавляют свойства в Node*
 
-| Extractor                  | property_name       | что кладёт                                | лимит по умолчанию      |
-| -------------------------- | ------------------- | ----------------------------------------- | ----------------------- |
-| `HeadlinesExtractor`       | `headlines`         | список заголовков                          | `max_num=5`             |
-| `KeyphrasesExtractor`      | `keyphrases`        | ключевые фразы                             | `max_num=5`             |
-| `NERExtractor`             | `entities`          | именованные сущности                       | `max_num_entities=10`   |
-| `ThemesExtractor`          | `themes`            | темы и концепции                           | `max_num_themes=10`     |
-| `SummaryExtractor`         | `summary`           | краткое содержание (до 10 предложений)     | —                       |
-| `TitleExtractor`           | `title`             | заголовок документа                        | —                       |
-| `TopicDescriptionExtractor`| `topic_description` | описание основной темы                     | —                       |
-| `EmbeddingExtractor`       | `embedding`         | вектор текста из `embed_property_name`     | —                       |
+| Extractor                   | property_name       | что кладёт                             | лимит по умолчанию    |
+|-----------------------------|---------------------|----------------------------------------|-----------------------|
+| `HeadlinesExtractor`        | `headlines`         | список заголовков                      | `max_num=5`           |
+| `KeyphrasesExtractor`       | `keyphrases`        | ключевые фразы                         | `max_num=5`           |
+| `NERExtractor`              | `entities`          | именованные сущности                   | `max_num_entities=10` |
+| `ThemesExtractor`           | `themes`            | темы и концепции                       | `max_num_themes=10`   |
+| `SummaryExtractor`          | `summary`           | краткое содержание (до 10 предложений) | —                     |
+| `TitleExtractor`            | `title`             | заголовок документа                    | —                     |
+| `TopicDescriptionExtractor` | `topic_description` | описание основной темы                 | —                     |
+| `EmbeddingExtractor`        | `embedding`         | вектор текста из `embed_property_name` | —                     |
 
 Все, кроме `EmbeddingExtractor`, — это LLM-вызовы со строгим structured output (Pydantic-модель + instructor), поэтому результат всегда типизирован. Проверить экстрактор в отрыве от пайплайна можно так (это иллюстрация для консоли, в пайплайне вызывать вручную не нужно):
 
@@ -215,12 +215,12 @@ await extractor.extract(node)
 
 Каждый `RelationshipBuilder` настраивается на работу с **конкретным свойством** узла (которое до этого положил туда экстрактор).
 
-| Builder                    | читает property        | тип создаваемого ребра               | смысл                                     |
-| -------------------------- | ---------------------- | ------------------------------------ | ----------------------------------------- |
-| `CosineSimilarityBuilder`  | `embedding`            | `new_property_name`                  | косинусная близость векторов               |
-| `SummaryCosineSimilarityBuilder` | `summary_embedding` | `summary_cosine_similarity`        | близость документов по саммари             |
-| `JaccardSimilarityBuilder` | `entities`             | `new_property_name`                  | Жаккар по множествам                       |
-| `OverlapScoreBuilder`      | `entities`             | **`{property_name}_overlap`**        | доля «пересекающихся» строк (fuzzy match)  |
+| Builder                          | читает property     | тип создаваемого ребра        | смысл                                     |
+|----------------------------------|---------------------|-------------------------------|-------------------------------------------|
+| `CosineSimilarityBuilder`        | `embedding`         | `new_property_name`           | косинусная близость векторов              |
+| `SummaryCosineSimilarityBuilder` | `summary_embedding` | `summary_cosine_similarity`   | близость документов по саммари            |
+| `JaccardSimilarityBuilder`       | `entities`          | `new_property_name`           | Жаккар по множествам                      |
+| `OverlapScoreBuilder`            | `entities`          | **`{property_name}_overlap`** | доля «пересекающихся» строк (fuzzy match) |
 
 Здесь спрятана **первая серьёзная ловушка** ragas: **имя типа ребра формируется по-разному** у разных builder-ов. `CosineSimilarityBuilder` берёт его из `new_property_name`, а `OverlapScoreBuilder` игнорирует `new_property_name` в типе и склеивает тип из `property_name`:
 
@@ -298,11 +298,11 @@ QueryLength: SHORT | MEDIUM | LONG
 
 В ragas 0.4.3 доступны три синтезатора:
 
-| Синтезатор                          | как выбирает узлы                                    | что требует в графе                              |
-| ----------------------------------- | ---------------------------------------------------- | ------------------------------------------------ |
-| `SingleHopSpecificQuerySynthesizer`  | все узлы, у которых есть `property_name`             | свойство узла (`entities` / `keyphrases`)         |
-| `MultiHopSpecificQuerySynthesizer`   | пары узлов, соединённые ребром типа `relation_type`  | ребра `*_overlap` + `overlapped_items` в ребре    |
-| `MultiHopAbstractQuerySynthesizer`   | кластеры узлов по ребрам со свойством `summary_similarity` (глубина до 3) | `summary_similarity` на ребрах + `themes` у узлов |
+| Синтезатор                          | как выбирает узлы                                                         | что требует в графе                               |
+|-------------------------------------|---------------------------------------------------------------------------|---------------------------------------------------|
+| `SingleHopSpecificQuerySynthesizer` | все узлы, у которых есть `property_name`                                  | свойство узла (`entities` / `keyphrases`)         |
+| `MultiHopSpecificQuerySynthesizer`  | пары узлов, соединённые ребром типа `relation_type`                       | ребра `*_overlap` + `overlapped_items` в ребре    |
+| `MultiHopAbstractQuerySynthesizer`  | кластеры узлов по ребрам со свойством `summary_similarity` (глубина до 3) | `summary_similarity` на ребрах + `themes` у узлов |
 
 Обратите внимание на дефолты: у обоих `Specific`-синтезаторов `property_name = "entities"`, а у multi-hop ещё и `relation_type = "entities_overlap"`. Это дефолты «под `NERExtractor`». Если вы, как в нашем пайплайне, строите граф на `keyphrases`, **оба параметра нужно переопределить**.
 
@@ -555,14 +555,14 @@ testset.to_pandas().to_csv("eval_dataset.csv", index=False)
 `testset.to_pandas()` даёт таблицу со следующими колонками:
 
 | колонка              | что внутри                                                            |
-| -------------------- | --------------------------------------------------------------------- |
-| `user_input`         | сгенерированный вопрос                                                 |
-| `reference_contexts` | список чанков, из которых он сгенерирован (для multi-hop с `<N-hop>`)  |
-| `reference`          | эталонный ответ, построенный **только** по этим контекстам              |
-| `persona_name`       | имя персонажа                                                          |
-| `query_style`        | `MISSPELLED` / `PERFECT_GRAMMAR` / `POOR_GRAMMAR` / `WEB_SEARCH_LIKE`   |
-| `query_length`       | `SHORT` / `MEDIUM` / `LONG`                                            |
-| `synthesizer_name`   | какой синтезатор породил строку                                        |
+|----------------------|-----------------------------------------------------------------------|
+| `user_input`         | сгенерированный вопрос                                                |
+| `reference_contexts` | список чанков, из которых он сгенерирован (для multi-hop с `<N-hop>`) |
+| `reference`          | эталонный ответ, построенный **только** по этим контекстам            |
+| `persona_name`       | имя персонажа                                                         |
+| `query_style`        | `MISSPELLED` / `PERFECT_GRAMMAR` / `POOR_GRAMMAR` / `WEB_SEARCH_LIKE` |
+| `query_length`       | `SHORT` / `MEDIUM` / `LONG`                                           |
+| `synthesizer_name`   | какой синтезатор породил строку                                       |
 
 Примеры вопросов из реального прогона (3 статьи, `testset_size=6` → 3 single-hop + 3 multi-hop):
 
