@@ -37,9 +37,10 @@ max_concurrency              сколько запросов к судье де�
 eval_dataset.csv
    │
    ▼
-[5] rows = run_rag_over_dataset(df)
-       для каждой строки датасета вызываем свой RAG и дописываем
-       две колонки: response и retrieved_contexts
+[5] run_rag(eval_dataset.csv, after_rag_dataset.csv)
+       если after_rag_dataset.csv нет — для каждой строки вызываем свой RAG
+       и дописываем две колонки: response и retrieved_contexts
+       если файл уже есть, читаем его и RAG повторно не гоняем
        это единственный шаг, который зависит от вашей конфигурации
    │
    │  rows: список dict с полным набором полей для метрик
@@ -62,6 +63,7 @@ eval_dataset.csv
    │
    ▼
 metrics_report.csv:  user_input | context_relevance | faithfulness | ... | synthesizer_name
+metrics_summary.csv: scope | n | faithfulness | ...   (all + разрез по synthesizer_name)
 ```
 
 > Ниже в блоках кода с комментарием-путём (например `# ragas/metrics/base.py`) показаны **внутренности библиотеки**. Их не нужно писать у себя — они приведены, чтобы было видно, откуда берутся ограничения, под которые мы подстраиваемся.
@@ -178,7 +180,7 @@ _Насколько ответ (`response`) совпадает с эталонн
 
 ## Собираем оценку
 
-Дальше — наш код. Полный файл: `full_eval.py`.
+Дальше — наш код. Полный файл: `pipeline_calculate_metrics.py`.
 
 ### 1. Судья
 
@@ -198,33 +200,34 @@ judge_embeddings = OpenAIEmbeddings(client=openai_client, model="text-embedding-
 ### 2. Прогон RAG по датасету ([5])
 
 ```python
-def run_rag_over_dataset(df: pd.DataFrame) -> list[dict]:
-    rows = []
-    for record in df.to_dict("records"):
-        result = rag(record["user_input"])
-        rows.append(
-            {
-                **record,
-                "response": result["answer"],
-                "retrieved_contexts": result["retrieved_contexts"],
-            }
-        )
-    return rows
+def run_rag(eval_dataset_pth, after_rag_dataset_pth) -> None:
+    df = pd.read_csv(eval_dataset_pth)
+    responses = []
+    retrieved_contexts = []
+    for user_input in df["user_input"]:
+        result = rag(user_input)
+        responses.append(result["answer"])
+        retrieved_contexts.append(result["retrieved_contexts"])
+    df["response"] = responses
+    df["retrieved_contexts"] = retrieved_contexts
+    df.to_csv(after_rag_dataset_pth, index=False)
 ```
 
-Ровно то, о чём говорили в начале: датасет описывает задачу, а `response` и `retrieved_contexts` дописывает ваша система. Всё, что ниже, от конфигурации RAG уже не зависит.
+Если `after_rag_dataset.csv` уже лежит рядом — этот шаг пропускаем и читаем готовый файл. Иначе прогоняем RAG по всем `user_input` и сохраняем результат: датасет описывает задачу, а `response` и `retrieved_contexts` дописывает ваша система. Всё, что ниже, от конфигурации RAG уже не зависит.
 
 ### 3. Набор метрик ([6])
 
 ```python
 def build_metrics(llm, embeddings) -> list[BaseMetric]:
     return [
-        ContextRelevance(llm=llm),
+        # ContextRelevance(llm=llm),
         Faithfulness(llm=llm),
-        AnswerRelevancy(llm=llm, embeddings=embeddings),
+        # AnswerRelevancy(llm=llm, embeddings=embeddings),
         AnswerCorrectness(llm=llm, embeddings=embeddings),
     ]
 ```
+
+`ContextRelevance` и `AnswerRelevancy` пока выключены: на строку это минус 5 вызовов LLM и 2 запроса к эмбеддингам. Когда понадобится полный набор — достаточно раскомментировать.
 
 Метрики, которым нужны только вердикты LLM, собираются одним аргументом; `AnswerRelevancy` и `AnswerCorrectness` дополнительно считают косинусы, поэтому им передаются эмбеддинги.
 
@@ -289,9 +292,21 @@ report.to_csv("metrics_report.csv", index=False)
 metric_names = [m.name for m in metrics]
 print(report[metric_names].mean(skipna=True))
 print(report.groupby("synthesizer_name")[metric_names].mean(skipna=True))
+
+overall = report[metric_names].mean(skipna=True).to_frame().T
+overall.insert(0, "scope", "all")
+by_synth = (
+    report.groupby("synthesizer_name")[metric_names]
+    .mean(skipna=True)
+    .reset_index()
+    .rename(columns={"synthesizer_name": "scope"})
+)
+pd.concat([overall, by_synth], ignore_index=True).to_csv(
+    "metrics_summary.csv", index=False
+)
 ```
 
-`skipna=True` здесь не декоративный: `Faithfulness` штатно возвращает `NaN`, когда из ответа не выделилось ни одного утверждения, а `ContextRelevance` — когда оба судьи исчерпали повторы.
+`skipna=True` здесь не декоративный: `Faithfulness` штатно возвращает `NaN`, когда из ответа не выделилось ни одного утверждения, а `ContextRelevance` — когда оба судьи исчерпали повторы. Построчные скоры остаются в `metrics_report.csv`; средние и разрез по `synthesizer_name` — в `metrics_summary.csv`, его удобнее открыть, когда не нужны длинные тексты вопросов и ответов.
 
 Разрез по `synthesizer_name` — главный аналитический приём этой части. Single-hop вопросы на маленьком корпусе почти всегда отвечаются хорошо и показывают потолок, а вот multi-hop требуют достать **два разных** чанка, и при `top_k=3` второй вполне может не попасть в выдачу. Разница между конфигурациями, если она есть, проявится именно там.
 
@@ -308,10 +323,6 @@ print(report.groupby("synthesizer_name")[metric_names].mean(skipna=True))
 > **TODO: заполнить после двух-трёх повторных прогонов одного и того же датасета с одной и той же конфигурацией.** Нужен разброс средних по каждой метрике.
 
 Это главный раздел с практической точки зрения, и его нельзя заменить рассуждением. LLM-судья недетерминирован, поэтому у каждой метрики есть собственный шум, и **любая разница между конфигурациями меньше этого шума не означает ничего**.
-
-Заранее известно, где шума будет больше всего, и это неприятным образом попадает ровно в нашу единственную метрику retrieval. `ContextRelevance`, как мы разобрали, выдаёт одно из пяти значений, поэтому на восьми строках у неё почти нет разрешения: стоит одному судье на одной строке изменить вердикт с 1 на 2, и среднее по датасету прыгает на 0.03. Метрики, которые усредняют по многим утверждениям (`Faithfulness` и фактологическая часть `AnswerCorrectness`), заметно стабильнее, а у `AnswerRelevancy` шум ещё ниже — она усредняет три косинуса, и на близких по смыслу вопросах они сами по себе стабильны.
-
-Отсюда практический вывод: если решение касается retrieval, а `ContextRelevance` не двигается, это не обязательно значит «улучшения нет» — возможно, метрике просто не хватает разрешения. Тогда либо увеличивайте датасет, либо добавляйте `ContextPrecisionWithReference`, которая даёт непрерывный скор и чувствительна к порядку контекстов.
 
 ## Сравнение конфигураций
 
