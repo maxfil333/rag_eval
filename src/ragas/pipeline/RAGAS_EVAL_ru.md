@@ -86,20 +86,22 @@ and will be removed in v1.0. Please use 'ragas.metrics.collections' instead.
 
 Метрики RAG удобно разложить по двум осям сразу: **какой слой** они проверяют и **нужен ли им эталон**. Вторая определяет, можете ли вы считать метрику по логам прода или обязаны иметь датасет из первой части.
 
-| Метрика                            | входы `ascore()`                                     | слой        | нужен `reference` |
-|------------------------------------|------------------------------------------------------|-------------|-------------------|
-| `ContextRelevance`                 | `user_input`, `retrieved_contexts`                   | retrieval   | нет               |
-| `ContextPrecisionWithoutReference` | `user_input`, `response`, `retrieved_contexts`       | retrieval   | нет               |
-| `ContextPrecisionWithReference`    | `user_input`, `reference`, `retrieved_contexts`      | retrieval   | да                |
-| `ContextRecall`                    | `user_input`, `retrieved_contexts`, `reference`      | retrieval   | да                |
-| `ContextEntityRecall`              | `reference`, `retrieved_contexts`                    | retrieval   | да                |
-| `Faithfulness`                     | `user_input`, `response`, `retrieved_contexts`       | generation  | нет               |
-| `ResponseGroundedness`             | `response`, `retrieved_contexts`                     | generation  | нет               |
-| `AnswerRelevancy`                  | `user_input`, `response` (+ эмбеддинги)              | generation  | нет               |
-| `AnswerCorrectness`                | `user_input`, `response`, `reference` (+ эмбеддинги) | end-to-end  | да                |
-| `FactualCorrectness`               | `response`, `reference`                              | end-to-end  | да                |
-| `NoiseSensitivity`                 | всё сразу                                            | диагностика | да                |
+| Метрика                            | входы `ascore()`                                            | слой        | нужен `reference` |
+|------------------------------------|-------------------------------------------------------------|-------------|-------------------|
+| `ContextRelevance`                 | `user_input`, `retrieved_contexts`                          | retrieval   | нет               |
+| `ContextPrecisionWithoutReference` | `user_input`, `response`, `retrieved_contexts`              | retrieval   | нет               |
+| `ContextPrecisionWithReference`    | `user_input`, `reference`, `retrieved_contexts`             | retrieval   | да                |
+| `ContextRecall`                    | `user_input`, `retrieved_contexts`, `reference`             | retrieval   | да                |
+| `ContextEntityRecall`              | `reference`, `retrieved_contexts`                           | retrieval   | да                |
+| `Faithfulness`                     | `user_input`, `response`, `retrieved_contexts`              | generation  | нет               |
+| `ResponseGroundedness`             | `response`, `retrieved_contexts`                            | generation  | нет               |
+| `AnswerRelevancy`                  | `user_input`, `response` (+ эмбеддинги)                     | generation  | нет               |
+| `AnswerCorrectness`                | `user_input`, `response`, `reference` (+ эмбеддинги)        | end-to-end  | да                |
+| `FactualCorrectness`               | `response`, `reference`                                     | end-to-end  | да                |
+| `NoiseSensitivity`                 | `user_input`, `response`, `reference`, `retrieved_contexts` | диагностика | да                |
 
+
+_Колонка «входы» — это сигнатура метода `ascore()`. Сигнатура не всегда совпадает с интуицией и `Faithfulness` — как раз такой случай. По смыслу метрика сравнивает ответ с контекстом, и вопрос ей вроде бы не нужен, но в реализации он **обязателен**: при пустом `user_input` метрика бросает `ValueError`, а сам вопрос идёт в промпт первого шага, где ответ разбивается на утверждения. Практическое следствие: посчитать `Faithfulness` по выгрузке, в которой сохранён только ответ и контекст, не получится. И наоборот, `ResponseGroundedness` меряет почти то же самое, но вопрос не требует._
 
 Отсюда практический набор, который мы возьмём дальше. По одной метрике на каждый вопрос, который мы хотим задать системе:
 
