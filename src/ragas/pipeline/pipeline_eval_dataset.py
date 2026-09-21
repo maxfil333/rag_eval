@@ -3,7 +3,6 @@ import asyncio
 from time import perf_counter
 from dotenv import load_dotenv
 
-from datasets import load_dataset
 from openai import AsyncOpenAI
 
 import ragas.async_utils as ragas_async_utils
@@ -29,39 +28,10 @@ from ragas.testset.transforms import (
 )
 from ragas.testset.transforms.extractors.llm_based import ThemesExtractor
 
+from src.ragas.pipeline.dataset import get_docs
+
 
 load_dotenv()
-
-# load dataset from huggingface
-
-HF_DATASET = "wikimedia/wikipedia"
-HF_CONFIG = "20231101.en"
-
-
-def load_hf_documents() -> list[str]:
-    """Load full Wikipedia articles by title (streaming, stops when all found)."""
-
-    doc_titles = [
-        "International Atomic Time",
-        "Agricultural science",
-        "Arithmetic mean",
-    ]
-
-    found: dict[str, str] = {}
-
-    stream = load_dataset(HF_DATASET, HF_CONFIG, split="train", streaming=True)
-    for row in stream:
-        title = row["title"]
-        if title in doc_titles:
-            found[title] = row["text"]
-            if len(found) == len(doc_titles):
-                break
-
-    missing = set(doc_titles) - found.keys()
-    if missing:
-        raise RuntimeError(f"Titles not found in {HF_DATASET}/{HF_CONFIG}: {sorted(missing)}")
-
-    return [found[title] for title in doc_titles]
 
 
 def _share_event_loop_across_ragas_runs(runner: asyncio.Runner) -> None:
@@ -231,5 +201,5 @@ def create_testset(docs: list[str]) -> None:
 
 
 if __name__ == "__main__":
-    docs = load_hf_documents()
+    docs = get_docs()
     create_testset(docs)

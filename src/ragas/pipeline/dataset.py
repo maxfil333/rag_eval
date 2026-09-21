@@ -1,3 +1,6 @@
+import os
+import json
+import pathlib
 from datasets import load_dataset
 from dotenv import load_dotenv
 
@@ -5,8 +8,7 @@ load_dotenv()
 
 HF_DATASET = "wikimedia/wikipedia"
 HF_CONFIG = "20231101.en"
-
-# Stable, early-in-stream, non-political topics (verified against the dump).
+DATASET_SAVE_PATH = "datas/docs.json"
 DOC_TITLES = [
     "International Atomic Time",
     "Agricultural science",
@@ -34,14 +36,26 @@ def load_hf_documents(titles: list[str] = DOC_TITLES) -> list[str]:
     return [found[title] for title in titles]
 
 
-docs = load_hf_documents()
-doc_titles = list(DOC_TITLES)
+def save_documents(pth: pathlib.Path, docs: list[str]) -> None:
+    os.makedirs(pth.parent, exist_ok=True)
+    with open(DATASET_SAVE_PATH, "w", encoding='utf-8') as f:
+        json.dump(docs, f, ensure_ascii=False, indent=4)
+
+
+def get_docs() -> list[str]:
+    if os.path.exists(DATASET_SAVE_PATH):
+        with open(DATASET_SAVE_PATH, "r", encoding='utf-8') as f:
+            docs = json.load(f)
+    else:
+        docs = load_hf_documents(DOC_TITLES)
+        save_documents(pth=pathlib.Path(DATASET_SAVE_PATH), docs=docs)
+    return docs
+
 
 
 if __name__ == "__main__":
-    print(f"Loaded {len(docs)} documents from {HF_DATASET}/{HF_CONFIG}")
-    for i, (title, doc) in enumerate(zip(doc_titles, docs)):
+    docs = get_docs()
+    for i, (title, doc) in enumerate(zip(DOC_TITLES, docs)):
         preview = " ".join(doc.split())[:100]
         print(f"[{i}] {title!r}  chars={len(doc)}  preview={preview!r}")
-
     print(docs)
